@@ -53,7 +53,7 @@ static int usage(int /* argc */, char* argv[], std::ostream& cerr) {
             "Usage:\n"
             "  "
          << argv[0]
-         << " [-s <SLOT#>|--slot=<SLOT#>] [-j|--json] [FILE|DEVICE]\n"
+         << " [-s <SLOT#>|--slot=<SLOT#>] [-j|--json] [-c|--create-with-dmsetup] [FILE|DEVICE]\n"
             "\n"
             "Options:\n"
             "  -s, --slot=N     Slot number or suffix.\n"
@@ -61,7 +61,8 @@ static int usage(int /* argc */, char* argv[], std::ostream& cerr) {
             "  -d, --dump-metadata-size\n"
             "                   Print the space reserved for metadata to stdout\n"
             "                   in bytes.\n"
-            "  -a, --all        Dump all slots (not available in JSON mode).\n";
+            "  -a, --all        Dump all slots (not available in JSON mode).\n"
+            "  -c  --create-with-dmsetup Generate commands for dmsetup.\n";
     return EX_USAGE;
 }
 
@@ -381,6 +382,35 @@ static void PrintMetadata(const LpMetadata& pt, std::ostream& cout) {
     }
 }
 
+static void PrintDmsetupCommands(const LpMetadata& pt, std::string super_path, std::ostream& cout) {
+    std::vector<std::tuple<std::string, const LpMetadataExtent*>> extents;
+
+    for (const auto& partition : pt.partitions) {
+        std::string name = GetPartitionName(partition);
+        std::string group_name = GetPartitionGroupName(pt.groups[partition.group_index]);
+        for (size_t i = 0; i < partition.num_extents; i++) {
+            const LpMetadataExtent& extent = pt.extents[partition.first_extent_index + i];
+            if (extent.target_type == LP_TARGET_TYPE_LINEAR) {
+                const auto& block_device = pt.block_devices[extent.target_source];
+            }
+            extents.push_back(std::make_tuple(name, &extent));
+        }
+    }
+    
+    std::sort(extents.begin(), extents.end(), [&](const auto& x, const auto& y) {
+        auto x_data = ParseLinearExtentData(pt, *std::get<1>(x));
+        auto y_data = ParseLinearExtentData(pt, *std::get<1>(y));
+        return x_data < y_data;
+    });
+
+    for (auto&& [name, extent] : extents) {
+        auto data = ParseLinearExtentData(pt, *extent);
+        if (!data) continue;
+        auto&& [block_device, offset] = *data;
+        cout << "dmsetup create " << name << " <<EOF\n0 " << extent->num_sectors << " linear "<< super_path << " " << offset <<"\nEOF\n";
+    }
+}
+
 static std::unique_ptr<LpMetadata> ReadDeviceOrFile(const std::string& path, uint32_t slot) {
     if (IsEmptySuperImage(path)) {
         return ReadFromImageFile(path);
@@ -397,6 +427,7 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
         { "json", no_argument, nullptr, 'j' },
         { "dump-metadata-size", no_argument, nullptr, 'd' },
         { "is-super-empty", no_argument, nullptr, 'e' },
+        { "create-with-dmsetup", no_argument, nullptr, 'c' },
         { nullptr, 0, nullptr, 0 },
     };
     // clang-format on
@@ -409,8 +440,10 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
     bool json = false;
     bool dump_metadata_size = false;
     bool dump_all = false;
+    bool dmsetup = false;
+
     std::optional<uint32_t> slot;
-    while ((rv = getopt_long_only(argc, argv, "s:jhde", options, &index)) != -1) {
+    while ((rv = getopt_long_only(argc, argv, "s:jhdec", options, &index)) != -1) {
         switch (rv) {
             case 'a':
                 dump_all = true;
@@ -436,8 +469,12 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
             case 'j':
                 json = true;
                 break;
+            case 'c':
+                dmsetup = true;
+                break;
             case '?':
             case ':':
+                cerr << "Failed parsing option "<<rv;
                 return usage(argc, argv, cerr);
         }
     }
@@ -492,6 +529,7 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
         return PrintJson(pt.get(), cout, cerr);
     }
 
+    
     if (!pt) {
         cerr << "Failed to read metadata.\n";
         return EX_NOINPUT;
@@ -517,11 +555,14 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
         num_slots = 1;
     }
 
-    if (num_slots > 1) {
+    if (num_slots > 1 && !dmsetup) {
         cout << "Slot " << slot.value() << ":\n";
     }
-    PrintMetadata(*pt.get(), cout);
-
+    if(!dmsetup)
+        PrintMetadata(*pt.get(), cout);
+    else
+        PrintDmsetupCommands(*pt.get(), super_path, cout);
+    
     if (dump_all) {
         for (uint32_t i = 1; i < num_slots; i++) {
             if (!override_super_name) {
@@ -532,9 +573,12 @@ int LpdumpMain(int argc, char* argv[], std::ostream& cout, std::ostream& cerr) {
             if (!pt) {
                 continue;
             }
-
-            cout << "\nSlot " << i << ":\n";
-            PrintMetadata(*pt.get(), cout);
+            if(!dmsetup){
+                cout << "\nSlot " << i << ":\n";
+                PrintMetadata(*pt.get(), cout);
+            }
+            else
+                PrintDmsetupCommands(*pt.get(), super_path, cout); 
         }
     }
     return EX_OK;
